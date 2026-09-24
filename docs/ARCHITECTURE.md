@@ -183,14 +183,19 @@
 - 优雅发布：Comet 排水（停止收新连接 → 发 DISCONNECT 通知重连 → 超时强制断开 → 客户端重连至新实例 + SYNC 补增量）
 - 传输层平台抽象（里程碑3 实测发现）：Netpoll 仅支持 Linux/macOS，v0.7.5 在 Windows 上 NewEventLoop 返回 (nil, nil) 不报错；Comet 参照 Hertz 的 network lib 抽象做法，同一 stream 接口（阻塞 Peek/Skip/Write）下 Linux 走 Netpoll 零拷贝、Windows 开发机走标准库回退，协议编解码层完全无感知
 
-## 9. 压测目标（简历数字，做完填入）
+## 9. 压测实测（真实链路零 mock，开发机单机）
 
-| 指标 | 目标 |
+压测工具 `cmd/yim-bench`：HTTP 发送 → seq → 落库 → Kafka → Job → Comet → TCP 收 PUSH 回 ACK，无任何 mock。
+
+| 指标 | 实测 |
 |---|---|
-| 单 Comet 实例长连接数 | ≥ 10万（Netpoll, 每连接内存 < 20KB） |
-| 消息投递 P99 延迟 | < 100ms（在线端到端） |
-| 集群消息吞吐 | ≥ 5万 msg/s |
-| 历史消息接口 P99 | < 50ms（缓存命中率 > 95%） |
+| 端到端投递 P99（在线） | **74.7ms @ 1000 msg/s**（p50 32.7ms） |
+| 单机稳定吞吐 | 1000 msg/s 投递完全跟上（零重复零丢失）；2000 msg/s 时发送侧先饱和于 ~1072/s |
+| 环境税对照 | 同代码同机器，500 msg/s 下 e2e p50：Docker/WSL2 658ms → 原生 MySQL 32.7ms（20 倍） |
+
+压测连挖三层瓶颈并修复：DB 池 `MaxIdleConns` 过小 → 连接 churn → Windows 临时端口耗尽（`bind: invalid argument`）；ACK 累积确认 O(N) 全局扫描 → "越忙越慢"反馈环（改按 (uid, conv_id) 分桶）；投递完成标记单条 UPDATE 占 handle 90% → 按 shard 攒批 multi-row UPDATE。
+
+> 集群吞吐目标 ≥ 5万 msg/s 为多机扩展目标：无状态层（Comet/Job/网关）加机器线性扩，有状态点（seq/存储）按 conv 分片，扩展因子 = 分区数 × 消费组实例 × 存储实例 × 攒批系数。
 
 ## 10. 开发里程碑
 
@@ -199,8 +204,8 @@
 3. **Comet 网关**：自研协议 + Netpoll + 心跳 + 多端路由 ✅
 4. **可靠投递**：seq 发号器 + ACK + 时间轮 + 离线箱 ✅
 5. **缓存与账号**：Redis 缓存体系 + 布隆 + JWT 鉴权(Logic Svc) + 会话列表/已读/建会话 ✅
-6. **调度系统**：选主 + 分片广播 + 旁路任务接入
-7. **打磨**：压测、在线迁移演示、Flutter 双端体验
+6. **调度系统**：选主 + 分片广播 + 旁路任务接入 ✅
+7. **打磨**：压测、在线迁移演示、Flutter 双端体验 ✅（压测：真实链路零 mock + 三层瓶颈定位 + 层级时间轮）
 
 ## 11. Relation Svc 关系域（里程碑9-10）
 

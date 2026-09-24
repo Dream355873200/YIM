@@ -31,3 +31,14 @@ _tls/
 yimd.exe
 *.exe
 deploy/tls/
+
+# runtime logs & agent/local config
+logs/
+.claude/
+
+# stray commit message temp
+.commit_msg.txt
+
+# signing keys
+*.jks
+*.keystore
