@@ -1,0 +1,15 @@
+YIM: Go 高并发 IM 后端（微服务 + 长连接网关 + 可靠投递 + 调度补偿）
+
+- 微服务拆分: yimd 网关 / logic / relation / message / seq / comet / job / sched
+  (Kitex RPC + etcd 服务发现, 超时/重试/熔断治理)
+- 长连接: 自研 TCP 协议帧 + Comet 多端连接索引 (netpoll/标准库双实现)
+- 可靠投递三道防线: 指数退避重试 -> 离线箱 -> local_message 扫表补偿
+  (Kafka 消费者组 at-least-once + 客户端 seq 去重 = 端到端恰好一次)
+- 数据分片: 1024 slot 预分片 + 交叉落库映射 + 按 (conv_id, seq) 聚簇主键
+- 号段发号: 双 buffer + 三类 seq 语义 (conv/user/sync 水位)
+- 幂等三道闸: 布隆过滤 -> Redis SETNX -> DB 唯一键
+- 调度系统四级防重: etcd 选主 -> window 时间桶 -> BLPop 抢占 -> SETNX 执行锁
+- 可观测: OTel 全链路 trace 分层传播 + zap 结构化日志
+- 压测: yim-bench 真实链路零 mock + 层级时间轮重试定时 (RetryTimer 可切换)
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>

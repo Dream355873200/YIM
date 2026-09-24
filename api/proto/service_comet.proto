@@ -1,0 +1,66 @@
+syntax = "proto3";
+
+package yim;
+
+option go_package = "github.com/yim/kitex_gen/yim;yim";
+
+// ============================================================
+// Comet Svc — 连接网关内部接口 (仅集群内部可达)
+//
+// 对应 goim 的 comet: 只做连接管理和协议编解码, 不含业务逻辑。
+// Job Svc 投递时经 Router 查到目标 comet 实例后调用此接口。
+// ============================================================
+
+service CometService {
+  // 向本实例上的指定连接推送轻通知 (CMD_MESSAGE_PUSH)
+  // 目标连接不在线(已被踢/断开)时返回 NOT_ONLINE, 由 Job 决定写离线箱
+  rpc PushMessage(PushMessageReq) returns (PushMessageRsp);
+
+  // 踢下线 (多端互踢 / token 失效): CMD_KICK 后断开连接
+  rpc Kick(KickReq) returns (KickRsp);
+
+  // 主动断开 (发布排水): CMD_DISCONNECT + 停止接收新连接
+  rpc Drain(DrainReq) returns (DrainRsp);
+
+  // 运维: 实例连接水位(压测/监控)
+  rpc Stats(CometStatsReq) returns (CometStatsRsp);
+}
+
+message PushMessageReq {
+  int64 uid = 1;
+  string device_id = 2;   // 多端: 精确到设备; 空串 = 推该 uid 全部在线设备
+  int64 conv_id = 3;
+  int64 max_seq = 4;
+  int64 from_uid = 5;
+  int64 user_sync_seq = 6;
+}
+
+message PushMessageRsp {
+  bool delivered = 1;     // false: 设备不在线, Job 走离线箱
+}
+
+message KickReq {
+  int64 uid = 1;
+  string device_id = 2;   // 被踢设备; 空 = 踢全部
+  string reason = 3;
+  int64 user_sync_seq = 4;
+}
+
+message KickRsp {}
+
+message DrainReq {
+  int32 timeout_ms = 1;   // 排水窗口, 超时强制断开
+}
+
+message DrainRsp {
+  int32 remaining_connections = 2;
+}
+
+message CometStatsReq {}
+
+message CometStatsRsp {
+  int64 online_connections = 1;
+  int64 rooms_count = 2;
+  double cpu_usage = 3;
+  int64 heartbeat_timeout_count = 4;
+}

@@ -1,0 +1,275 @@
+syntax = "proto3";
+
+package yim;
+
+import "common.proto";
+
+option go_package = "github.com/yim/kitex_gen/yim;yim";
+
+// ============================================================
+// Relation Svc — 关系域 (里程碑9): 好友 / 群成员 / 用户资料 / 在线状态
+//
+// 数据全部落 yim_meta (与 users 同库)。
+// 已知债务: 踢人/退群需直写 message 域的 user_conversations/conversations
+// (member_uids JSON) —— relation→message 与 message→relation (好友校验)
+// 会成双向 RPC 依赖, 第一轮以"同库共表"换解耦, 后续收口归属。
+//
+// 业务错误码 (Error.code, 与 docs/errors.md 对齐):
+//   20 已是好友   21 申请不存在或无权操作   22 非好友关系
+//   23 无群主权限 (含群主不可退群)   24 已是群成员   25 非群成员
+//   26 申请已处理   27 昵称已被占用
+// ============================================================
+
+service RelationService {
+  // ---- 好友 ----
+
+  // 发好友申请: (from,to) 行内状态机, 重复申请幂等;
+  // 互为 pending 自动合并为互相接受
+  rpc SendFriendRequest(SendFriendRequestReq) returns (SendFriendRequestRsp);
+
+  // 处理收到的申请: accept 同事务写双向 friendships
+  rpc HandleFriendRequest(HandleFriendRequestReq) returns (HandleFriendRequestRsp);
+
+  // 申请列表: direction=in 收到的 / out 发出的
+  rpc ListFriendRequests(ListFriendRequestsReq) returns (ListFriendRequestsRsp);
+
+  // 好友列表 (含资料), PK 前缀分页
+  rpc ListFriends(ListFriendsReq) returns (ListFriendsRsp);
+
+  // 删除好友: 删双向 friendships 行, 申请历史保留
+  rpc DeleteFriend(DeleteFriendReq) returns (DeleteFriendRsp);
+
+  // 好友关系判定: Message Svc CreateConv 单聊校验专用 (fail-close)
+  rpc CheckFriendship(CheckFriendshipReq) returns (CheckFriendshipRsp);
+
+  // ---- 群 ----
+
+  // 加群成员: 建群 seed + 拉人共用, 幂等 upsert (重复拉已在校成员不报错)。
+  // owner_uid = 操作者: 建群 (群尚无成员) 时操作者即群主 (其行 role=1);
+  // 群已存在时操作者必须是群主 (code 23)
+  rpc AddGroupMembers(AddGroupMembersReq) returns (AddGroupMembersRsp);
+
+  // 踢人: 仅群主 (role=1); 同步删 message 域的会话索引
+  rpc RemoveGroupMember(RemoveGroupMemberReq) returns (RemoveGroupMemberRsp);
+
+  // 退群: 群主不可退 (先转让/解散, 后续里程碑)
+  rpc QuitGroup(QuitGroupReq) returns (QuitGroupRsp);
+
+  // 群成员列表 (含 role 与资料)
+  rpc ListGroupMembers(ListGroupMembersReq) returns (ListGroupMembersRsp);
+
+  // 改群信息 (群名/群头像, 里程碑11): 仅群主; 直写 message 域 conversations
+  // + InvalidateConv (同上已知债务: 同库共表换解耦)
+  rpc UpdateGroupInfo(UpdateGroupInfoReq) returns (UpdateGroupInfoRsp);
+
+  // ---- 资料 / 在线状态 ----
+
+  // 批量查用户资料 (会话列表/聊天头渲染用), clamp 50
+  rpc GetProfiles(GetProfilesReq) returns (GetProfilesRsp);
+
+  // 搜索用户 (加好友预览: uid 精确 / 昵称前缀), 返回脱敏资料, clamp 20
+  rpc SearchUsers(SearchUsersReq) returns (SearchUsersRsp);
+
+  // 改资料: nickname 冲突 code 27; avatar 由网关上传接口写入
+  rpc UpdateProfile(UpdateProfileReq) returns (UpdateProfileRsp);
+
+  // 在线状态查询 (连接级): EXISTS route:{uid} —— 60s TTL 心跳续期,
+  // 心跳断档即离线; 查询制不做订阅推送
+  rpc GetPresence(GetPresenceReq) returns (GetPresenceRsp);
+}
+
+// ---------- 好友 ----------
+
+message SendFriendRequestReq {
+  int64 from_uid = 1;      // 网关注入 (token 身份)
+  int64 to_uid = 2;
+  string message = 3;      // 验证消息, 可空
+}
+
+message SendFriendRequestRsp {
+  Error error = 1;         // 20 已是好友; 成功时 error 为空
+}
+
+message HandleFriendRequestReq {
+  int64 op_uid = 1;        // 操作者, 必须等于 to_uid
+  int64 from_uid = 2;      // 申请发起者
+  bool accept = 3;
+}
+
+message HandleFriendRequestRsp {
+  Error error = 1;         // 21 不存在/无权; 26 已处理
+}
+
+message FriendRequest {
+  int64 from_uid = 1;
+  int64 to_uid = 2;
+  string message = 3;
+  int32 status = 4;        // 0 pending 1 accepted 2 rejected
+  int64 create_time_ms = 5;
+}
+
+message ListFriendRequestsReq {
+  int64 uid = 1;
+  bool incoming = 2;       // true=收到的申请, false=我发出的
+}
+
+message ListFriendRequestsRsp {
+  repeated FriendRequest requests = 1;
+  Error error = 2;
+}
+
+message FriendBrief {
+  int64 uid = 1;
+  string nickname = 2;
+  string avatar = 3;
+  int64 create_time_ms = 4; // 成为好友的时间
+}
+
+message ListFriendsReq {
+  int64 uid = 1;
+  PageInfo page = 2;
+}
+
+message ListFriendsRsp {
+  repeated FriendBrief friends = 1;
+  bool has_more = 2;
+  Error error = 3;
+}
+
+message DeleteFriendReq {
+  int64 op_uid = 1;
+  int64 friend_uid = 2;
+}
+
+message DeleteFriendRsp {
+  Error error = 1;
+}
+
+message CheckFriendshipReq {
+  int64 a_uid = 1;
+  int64 b_uid = 2;
+}
+
+message CheckFriendshipRsp {
+  bool is_friend = 1;
+}
+
+// ---------- 群 ----------
+
+message AddGroupMembersReq {
+  int64 conv_id = 1;
+  repeated int64 member_uids = 2;
+  int64 owner_uid = 3;     // 操作者: 建群 = 群主 (首行 role=1); 拉人 = 必须已是群主
+}
+
+message AddGroupMembersRsp {
+  Error error = 1;
+}
+
+message RemoveGroupMemberReq {
+  int64 op_uid = 1;        // 必须是群主
+  int64 conv_id = 2;
+  int64 target_uid = 3;
+}
+
+message RemoveGroupMemberRsp {
+  Error error = 1;
+}
+
+message QuitGroupReq {
+  int64 uid = 1;
+  int64 conv_id = 2;
+}
+
+message QuitGroupRsp {
+  Error error = 1;
+}
+
+message GroupMember {
+  int64 uid = 1;
+  int32 role = 2;          // 0 member 1 owner
+  string nickname = 3;
+  string avatar = 4;
+  int64 join_time_ms = 5;
+}
+
+message ListGroupMembersReq {
+  int64 conv_id = 1;
+}
+
+message ListGroupMembersRsp {
+  repeated GroupMember members = 1;
+  Error error = 2;
+}
+
+// 改群信息 (里程碑11): 仅群主 (code 23); 字段按传入与否覆盖 (空串=不改名, 用
+// update_mask 语义简化为"字段级可选", protojson 缺省字段不覆盖)
+message UpdateGroupInfoReq {
+  int64 op_uid = 1;        // 操作者, 必须是群主
+  int64 conv_id = 2;
+  string name = 3;         // 传才更新 (空串视为不改)
+  string avatar = 4;       // 群头像相对 URL, 传才更新
+}
+
+message UpdateGroupInfoRsp {
+  Error error = 1;         // 23 非群主 / 25 非成员
+}
+
+// ---------- 资料 / 在线状态 ----------
+
+message GetProfilesReq {
+  repeated int64 uids = 1; // clamp 50
+}
+
+message GetProfilesRsp {
+  repeated UserProfile profiles = 1;
+  Error error = 2;
+}
+
+message SearchUsersReq {
+  string keyword = 1;      // 纯数字 = uid 精确匹配 OR 昵称前缀; 否则昵称前缀
+  int64 op_uid = 2;        // 排除自己
+  int32 limit = 3;         // clamp 20
+}
+
+message SearchUsersRsp {
+  repeated UserProfile profiles = 1;
+  Error error = 2;
+}
+
+message UserProfile {
+  int64 uid = 1;
+  string nickname = 2;
+  string avatar = 3;       // 相对 URL (/files/avatar/..), 客户端拼 base
+}
+
+message UpdateProfileReq {
+  int64 uid = 1;
+  string nickname = 2;     // 空 = 不改
+  string avatar = 3;       // 空 = 不改
+}
+
+message UpdateProfileRsp {
+  UserProfile profile = 1;
+  Error error = 2;         // 27 昵称被占用
+}
+
+enum Presence {
+  PRESENCE_UNKNOWN = 0;
+  PRESENCE_OFFLINE = 1;
+  PRESENCE_ONLINE = 2;
+}
+
+message GetPresenceReq {
+  repeated int64 uids = 1; // clamp 50
+}
+
+message PresenceInfo {
+  int64 uid = 1;
+  Presence presence = 2;
+}
+
+message GetPresenceRsp {
+  repeated PresenceInfo presences = 1;
+  Error error = 2;
+}

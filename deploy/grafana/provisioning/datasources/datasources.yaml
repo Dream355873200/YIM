@@ -1,0 +1,24 @@
+apiVersion: 1
+datasources:
+  - name: Jaeger
+    uid: jaeger
+    type: jaeger
+    access: proxy
+    url: http://jaeger:16686
+    isDefault: false
+  - name: Loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+    isDefault: true
+    # 关键: 日志->链路互跳, 按 trace_id 字段关联
+    jsonData:
+      derivedFields:
+        - name: TraceID
+          matcherRegex: '"trace_id":"(\w+)"'
+          url: "$${__value.raw}"
+          datasourceUid: jaeger
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090

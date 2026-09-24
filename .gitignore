@@ -1,0 +1,33 @@
+# bin
+bin/
+
+# ide
+.idea/
+.vscode/
+
+# os
+.DS_Store
+Thumbs.db
+
+# local env & data
+.env
+*.log
+data/
+
+# study notes (local only)
+docs/STUDY.md
+
+# study handbook (local only)
+docs/study/
+
+# etcd dev data
+default.etcd/
+
+# stray artifacts
+nul
+_tls/
+
+# build artifacts & local tls (gen-tls.cmd regenerable)
+yimd.exe
+*.exe
+deploy/tls/

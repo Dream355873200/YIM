@@ -1,0 +1,48 @@
+syntax = "proto3";
+
+package yim;
+
+import "common.proto";
+
+option go_package = "github.com/yim/kitex_gen/yim;yim";
+
+// ============================================================
+// Logic Svc — 账号与登录态 (里程碑5)
+//
+// 职责: 注册/登录/令牌签发。JWT 采用 HS256 无状态验签:
+//   - Comet 收到 CONNECT 时本地验签, 不产生每次连接一次的验签 RPC
+//   - 密钥从配置下发, 轮换靠双密钥过渡窗口 (扩展位, 当前单密钥)
+//   - 主动踢下线/注销走 Redis 黑名单 (jti), 扩展位
+// 多端踢出也属 Logic 职责, 当前由 Comet 同设备顶替承载。
+// ============================================================
+
+service LogicService {
+  // 注册: nickname 全局唯一, uid 走号段发号
+  rpc Register(RegisterReq) returns (RegisterRsp);
+
+  // 登录: 校验密码 (bcrypt) → 签发 JWT
+  rpc Login(LoginReq) returns (LoginRsp);
+}
+
+message RegisterReq {
+  string nickname = 1;
+  string password = 2;
+}
+
+message RegisterRsp {
+  int64 uid = 1;
+  Error error = 2;
+}
+
+message LoginReq {
+  string nickname = 1;
+  string password = 2;
+  DeviceInfo device = 3;   // 审计/多端策略预留
+}
+
+message LoginRsp {
+  string token = 1;        // JWT, Comet CONNECT 直接携带
+  int64 uid = 2;
+  int64 expire_at_ms = 3;
+  Error error = 4;
+}

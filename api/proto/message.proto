@@ -1,0 +1,83 @@
+syntax = "proto3";
+
+package yim;
+
+option go_package = "github.com/yim/kitex_gen/yim;yim";
+
+// ============================================================
+// 消息与会话核心结构
+// 存储约定: 消息表按 conv_id hash 分库分表(2库×4表),
+// 同一会话必落同一分片 —— seq 连续性与会话内有序的前提。
+// ============================================================
+
+enum ConvType {
+  CONV_UNKNOWN = 0;
+  CONV_SINGLE = 1;  // 单聊
+  CONV_GROUP = 2;   // 群聊
+}
+
+// conv_id 生成规则: 号段分配 + 嵌入创建者分片基因
+// 结构: [1bit标志][41bit时间戳][12bit分片基因][10bit自增]
+// 分片基因 = 创建者 uid 对分片数取模 → 关系查询可直路由, 免二次hash
+message Conv {
+  int64 conv_id = 1;
+  ConvType type = 2;
+  // 单聊: 两端 uid, 存储时约定小 uid 在前保证同一单聊唯一
+  repeated int64 member_uids = 3;
+  int64 create_time_ms = 4;
+  int64 last_seq = 5;      // 冗余最新 seq, 会话列表免查消息表
+  string name = 6;         // 群名 (里程碑11, 单聊空串)
+  string avatar = 7;       // 群头像相对 URL (/files/img/...), 单聊空串
+}
+
+enum MsgType {
+  MSG_UNKNOWN = 0;
+  MSG_TEXT = 1;
+  MSG_IMAGE = 2;
+  MSG_FILE = 3;
+  MSG_AUDIO = 4;
+  MSG_REVOKE = 10;   // 撤回: 特殊消息体, 客户端据此更新本地
+  MSG_SYSTEM = 11;   // 系统通知(入群/踢人等)
+}
+
+message ConvMsgContent {
+  MsgType type = 1;
+  string text = 2;
+  // 图片/文件/语音走对象存储客户端直传, 这里只存元数据
+  MediaMeta media = 3;
+  // 撤回/系统类消息的扩展字段
+  Ext ext = 4;
+}
+
+message MediaMeta {
+  string url = 1;
+  int64 size = 2;
+  int32 width = 3;
+  int32 height = 4;
+  int32 duration_ms = 5;
+}
+
+message Ext {
+  int64 ref_msg_id = 1;   // 撤回/回复的目标消息
+  int64 op_uid = 2;       // 操作者
+  string json = 3;        // 兜底扩展, 优先走强类型字段
+  string ref_text = 4;    // 回复引用的预览文本快照 (原消息可能已不在拉取窗口内)
+}
+
+// 存储行结构(服务端内部/同步响应共用)
+message ConvMessage {
+  int64 msg_id = 1;
+  int64 conv_id = 2;
+  int64 from_uid = 3;
+  int64 seq = 4;
+  int64 server_time_ms = 5;
+  ConvMsgContent content = 6;
+}
+
+// 发送者视角的消息状态机(仅上行未落库阶段有用, 落库后由 seq 决定)
+enum SendState {
+  SEND_UNKNOWN = 0;
+  SEND_PENDING = 1;  // 已发出未收到 UP_RSP → 时间轮重试
+  SEND_OK = 2;
+  SEND_FAILED = 3;
+}

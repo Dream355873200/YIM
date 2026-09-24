@@ -1,0 +1,32 @@
+syntax = "proto3";
+
+package yim;
+
+option go_package = "github.com/yim/kitex_gen/yim;yim";
+
+// ============================================================
+// Job Svc 事件契约 —— Kafka topic 载荷 (不作为 RPC 接口)
+//
+//   topic yim.push : Message Svc 事务提交后写的投递事件 → Job 消费推送
+//   topic yim.ack  : 客户端 ACK 经 Comet→Message Svc 后转发的确认事件
+//                    → Job 消费取消重试定时
+//
+// 分区键约定: 两类事件均以 conv_id 为 key —— 同会话事件落在同一分区,
+// 保证会话内投递事件有序 (at-least-once, 重复由客户端按 seq 去重)。
+// ============================================================
+
+// 投递事件: 与 internal/message.PushEvent 同构 (发送事务提交后触发)
+message DeliveryEvent {
+  int64 conv_id = 1;
+  int64 max_seq = 2;        // 本批增量水位 (当前单条消息, 预留批量)
+  int64 from_uid = 3;
+  int64 user_sync_seq = 4;  // 发送者用户级水位 (投递层按接收者单独 bump)
+  int64 msg_id = 5;         // 投递完成后回写 local_message.status=1 (防线3 扫表增量)
+}
+
+// 确认事件: 客户端累积确认 (取消 seq <= ack_seq 的重试定时)
+message AckEvent {
+  int64 uid = 1;
+  int64 conv_id = 2;
+  int64 ack_seq = 3;
+}

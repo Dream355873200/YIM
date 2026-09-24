@@ -1,0 +1,80 @@
+syntax = "proto3";
+
+package yim;
+
+option go_package = "github.com/yim/kitex_gen/yim;yim";
+
+// ============================================================
+// Seq Svc 发号器 (对标微信 seqsvr)
+//
+// 两类序列:
+//   1. 会话 seq: 每会话单调递增, 消息排序的唯一依据
+//   2. 用户 sync seq: 每用户单调递增, 任意"会话有新消息"事件时+1,
+//      客户端用它判断"有没有漏", 配合 SYNC 协议做增量同步
+//
+// 实现: 号段模式双 buffer —— 一次从 DB 取一段(默认 10000),
+// 内存发号; 当前号段消耗到 10% 时异步加载下一段。
+// DB 宕机时内存号段可继续支撑, 号段步长 = 可用性窗口 × 峰值速率。
+// ============================================================
+
+service SeqService {
+  // 通用实体 ID 发号 (biz=uid/msg/conv_id, key=0)。
+  // 会话 seq 与用户 sync seq 有专属语义接口, 见下。
+  rpc AllocId(AllocIdReq) returns (AllocIdRsp);
+
+  // 批量申请会话 seq。Message Svc 每条消息调用一次(单聊/群聊均一批=1),
+  // 水平扩展无冲突: 号段由 DB 行锁保证全局唯一区间。
+  rpc AllocConvSeq(AllocConvSeqReq) returns (AllocConvSeqRsp);
+
+  // 用户 sync seq: 递增并返回新值。
+  // Job Svc 消费消息投递成功后调用, 不在发送主链路上。
+  rpc BumpSyncSeq(BumpSyncSeqReq) returns (BumpSyncSeqRsp);
+
+  // 查询当前水位(ConnectRsp 下发用), 只读
+  rpc GetSyncSeq(GetSyncSeqReq) returns (GetSyncSeqRsp);
+
+  // 创建会话时初始化 (conv_id 注册, seq 从 1 开始)
+  rpc InitConv(InitConvReq) returns (InitConvRsp);
+}
+
+message AllocIdReq {
+  string biz = 1;    // uid / msg / conv_id ...
+  int64 key_id = 2;  // 分片键, 实体 ID 固定 0
+  int32 count = 3;
+}
+
+message AllocIdRsp {
+  int64 start = 1;   // 分配区间 [start, start+count-1]
+}
+
+message AllocConvSeqReq {
+  int64 conv_id = 1;
+  int32 count = 2;   // 一次批量申请数, 预留群聊合并写场景
+}
+
+message AllocConvSeqRsp {
+  int64 start = 1;   // 分配区间 [start, start+count-1]
+  int32 count = 2;
+}
+
+message BumpSyncSeqReq {
+  int64 uid = 1;
+}
+
+message BumpSyncSeqRsp {
+  int64 sync_seq = 1; // 递增后的新水位
+}
+
+message GetSyncSeqReq {
+  int64 uid = 1;
+}
+
+message GetSyncSeqRsp {
+  int64 sync_seq = 1;
+}
+
+message InitConvReq {
+  int64 conv_id = 1;
+}
+
+message InitConvRsp {}

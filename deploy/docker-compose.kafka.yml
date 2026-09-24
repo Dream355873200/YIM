@@ -1,0 +1,59 @@
+# 3-broker KRaft 集群 (单机, 里程碑8 终局压测):
+#   docker compose -f deploy/docker-compose.kafka.yml up -d
+#
+# 目的: 消掉"单 broker 软件瓶颈" (请求处理线程/分区 leader 排队), 把
+# producer 背压墙 (~1600/s) 往上推, 暴露下一层硬件墙 (WSL2 虚拟盘/回环网)。
+# 三个容器共享宿主机的盘/CPU/网卡 —— 测出的是"硬件上限 × 3 broker 摊薄",
+# 不是三台机器的分布式上限 (15.8 方法论: 单机标定地板, 上限 = 地板乘法)。
+#
+# 端口: 9092/9093/9094 = 三 broker 的宿主机入口 (YIM_KAFKA_BROKERS 全列);
+#       19092 容器间 inter-broker; 29093 controller 仲裁 (不出容器网络)。
+# advertised = localhost: 主机上的 yim-message/yim-job 直连。
+version: "3.8"
+
+x-kafka-env: &kafka-env
+  KAFKA_PROCESS_ROLES: broker,controller
+  KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka-1:29093,2@kafka-2:29093,3@kafka-3:29093
+  KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: EXTERNAL:PLAINTEXT,INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+  KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+  KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+  KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+  KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
+  KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+  KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+  KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false" # topic 显式建, 分区数是压测变量不许漂移
+  CLUSTER_ID: 5L6g3nShT-eMCtK--X86sw
+
+services:
+  kafka-1:
+    image: m.daocloud.io/docker.io/apache/kafka:3.9.0
+    container_name: yim-kafka-1
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 1
+      KAFKA_LISTENERS: EXTERNAL://0.0.0.0:9092,INTERNAL://0.0.0.0:19092,CONTROLLER://kafka-1:29093
+      KAFKA_ADVERTISED_LISTENERS: EXTERNAL://localhost:9092,INTERNAL://kafka-1:19092
+    ports:
+      - "9092:9092"
+
+  kafka-2:
+    image: m.daocloud.io/docker.io/apache/kafka:3.9.0
+    container_name: yim-kafka-2
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 2
+      KAFKA_LISTENERS: EXTERNAL://0.0.0.0:9093,INTERNAL://0.0.0.0:19092,CONTROLLER://kafka-2:29093
+      KAFKA_ADVERTISED_LISTENERS: EXTERNAL://localhost:9093,INTERNAL://kafka-2:19092
+    ports:
+      - "9093:9093"
+
+  kafka-3:
+    image: m.daocloud.io/docker.io/apache/kafka:3.9.0
+    container_name: yim-kafka-3
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 3
+      KAFKA_LISTENERS: EXTERNAL://0.0.0.0:9094,INTERNAL://0.0.0.0:19092,CONTROLLER://kafka-3:29093
+      KAFKA_ADVERTISED_LISTENERS: EXTERNAL://localhost:9094,INTERNAL://kafka-3:19092
+    ports:
+      - "9094:9094"

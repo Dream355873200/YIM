@@ -1,0 +1,213 @@
+syntax = "proto3";
+
+package yim;
+
+import "common.proto";
+import "message.proto";
+import "protocol.proto";
+
+option go_package = "github.com/yim/kitex_gen/yim;yim";
+
+// ============================================================
+// Message Svc — 消息主链路
+//
+// 发送事务模型(最终一致, 无分布式事务):
+//   同一本地事务内: 消息落库(分片) + 本地消息表插入
+//   事务提交后: 写 Kafka(投递事件) → Job Svc 消费推送
+//   Kafka 写失败: 本地消息表遗留 → Scheduler 扫描补偿(防线3)
+//   幂等保障: client_msg_id 先布隆粗筛(拦截99%) → Redis SETNX 精查
+// ============================================================
+
+service MessageService {
+  // 上行消息 (Comet 转发客户端 CMD_MESSAGE_UP)
+  rpc SendMessage(SendMessageReq) returns (SendMessageRsp);
+
+  // 会话内历史消息, 按 seq 区间/倒序分页
+  // 读路径: Redis ZSET(conv:{id}:recent) 未命中 → 从库
+  rpc PullHistory(PullHistoryReq) returns (PullHistoryRsp);
+
+  // SYNC 增量同步 (Comet 转发 CMD_SYNC)
+  // 按 user_sync_seq 找变更会话集合 → 各会话按 watermark 差集拉增量
+  rpc Sync(SyncReq2) returns (SyncRsp2);
+
+  // 推送 ACK 回路: Comet 收到客户端 ACK_FOR_PUSH 后转发到这里,
+  // 取消该消息的投递重试定时 (时间轮), 并推进投递水位。
+  rpc AckPush(AckPushReq) returns (AckPushRsp);
+
+  // 撤回: 写一条 MSG_REVOKE 消息(复用投递链路), 校验时间窗口与权限
+  rpc RevokeMessage(RevokeMessageReq) returns (RevokeMessageRsp);
+
+  // 已读回执: 不产生消息, 只推进 conv_id 的 read_seq
+  // 未读数 = last_seq - max(read_seq, 同步水位), 对账任务兜底修正
+  rpc MarkRead(MarkReadReq) returns (MarkReadRsp);
+
+  // 已读状态查询: 返回会话各成员的 read_seq。
+  // READ 事件是实时的 (MarkRead 才发), 对端在拉取之前读过的水位无事件 ——
+  // 客户端进窗拉一次补齐, 否则"对端先读过"永远不显示已读。
+  rpc GetReadState(GetReadStateReq) returns (GetReadStateRsp);
+
+  // 会话列表: conv 元数据 + last_seq + 未读数, 走缓存
+  rpc ListConversations(ListConversationsReq) returns (ListConversationsRsp);
+
+  // 全文搜索 (里程碑13): 用户全部会话的 MSG_TEXT LIKE 扫描, 按时间倒序。
+  // 分库分表下不走 MySQL FULLTEXT (内容是 JSON 列), 逐分片 LIKE + 内存归并,
+  // 规模上去后演进 ES/倒排索引 —— 搜索是低频只读操作, DB 扫描可接受
+  rpc SearchMessages(SearchMessagesReq) returns (SearchMessagesRsp);
+
+  // 建会话: 单聊 (去重) / 群聊。里程碑5 临时归属 Message Svc,
+  // 好友关系/群管理落地 Relation Svc 后迁移。
+  rpc CreateConv(CreateConvReq) returns (CreateConvRsp);
+}
+
+// ---------- 发送 ----------
+
+message SendMessageReq {
+  uint64 client_msg_id = 1;
+  int64 conv_id = 2;
+  int64 from_uid = 3;      // Comet 已鉴权, from_uid 不信任客户端原始请求
+  ConvMsgContent content = 4;
+}
+
+message SendMessageRsp {
+  int64 msg_id = 1;
+  int64 seq = 2;
+  int64 server_time_ms = 3;
+  Error error = 4;         // 幂等命中时返回已存在的 msg_id/seq, 不视为错误
+}
+
+// ---------- 历史拉取 ----------
+
+message PullHistoryReq {
+  int64 conv_id = 1;
+  // 二选一: 按 seq 精确拉段, 或倒序分页
+  PullMode mode = 2;
+  int64 from_seq = 3;      // mode=SEQ_RANGE 时生效, [from_seq, to_seq]
+  int64 to_seq = 4;
+  int64 before_seq = 5;    // mode=PAGE_BACKWARD 时生效, 取 < before_seq 的
+  int32 limit = 6;         // 服务端 clamp 至 100
+  int64 op_uid = 7;        // 发起者 (里程碑9 成员校验: 非会话成员拒绝, 防越权读)
+}
+
+enum PullMode {
+  PULL_UNKNOWN = 0;
+  PULL_SEQ_RANGE = 1;
+  PULL_PAGE_BACKWARD = 2;
+}
+
+message PullHistoryRsp {
+  repeated ConvMessage messages = 1;
+  bool has_more = 2;       // PULL_PAGE_BACKWARD 时指示还有更早的
+  int64 min_seq = 3;       // 本会话最老消息 seq, 客户端判断能否继续翻页
+  Error error = 4;         // 业务错误 (里程碑9: op_uid 非会话成员 code 25)
+}
+
+// ---------- 同步 ----------
+
+// SyncReq2/SyncRsp2: 与 protocol.proto 的 SYNC 指令 body 同构,
+// 但作为 gRPC 接口服务端可返回更多信息(overflow 等)
+message SyncReq2 {
+  int64 uid = 1;
+  int64 user_sync_seq = 2;
+  repeated ConvWatermark watermarks = 3;
+}
+
+message SyncRsp2 {
+  int64 user_sync_seq = 1;
+  repeated ConvMessage messages = 2;
+  repeated ConvWatermark overflow = 3;
+}
+
+// ---------- 推送 ACK ----------
+
+message AckPushReq {
+  int64 uid = 1;         // 确认者 (接收端)
+  int64 conv_id = 2;
+  int64 ack_seq = 3;     // 累积确认: conv 内 <= ack_seq 的待确认推送全部完成
+}
+
+message AckPushRsp {}
+
+// ---------- 撤回 ----------
+
+message RevokeMessageReq {
+  int64 msg_id = 1;
+  int64 conv_id = 2;
+  int64 op_uid = 3;
+}
+
+message RevokeMessageRsp {
+  int64 revoke_msg_id = 1;  // MSG_REVOKE 消息自身的 id
+  int64 seq = 2;
+  Error error = 3;          // code 30: 非本人消息 (时间窗/不存在走 500 明细)
+}
+
+// ---------- 已读 ----------
+
+message MarkReadReq {
+  int64 uid = 1;
+  int64 conv_id = 2;
+  int64 read_seq = 3;      // 客户端累积确认水位
+}
+
+message MarkReadRsp {}
+
+message GetReadStateReq {
+  int64 op_uid = 1;        // 必须为会话成员 (code 25)
+  int64 conv_id = 2;
+}
+
+message GetReadStateRsp {
+  repeated ReadState states = 1; // 每成员一行 (含查询者自己)
+  Error error = 2;
+}
+
+message ReadState {
+  int64 uid = 1;
+  int64 read_seq = 2;
+}
+
+// ---------- 会话列表 ----------
+
+message ListConversationsReq {
+  int64 uid = 1;
+  PageInfo page = 2;
+}
+
+message ConversationBrief {
+  Conv conv = 1;
+  int64 unread_count = 2;
+  ConvMessage last_message = 3; // 最近一条, ZSET recent 直接取
+}
+
+message ListConversationsRsp {
+  repeated ConversationBrief conversations = 1;
+  bool has_more = 2;
+}
+
+// ---------- 建会话 ----------
+
+message CreateConvReq {
+  ConvType type = 1;
+  repeated int64 member_uids = 2;
+  int64 owner_uid = 3;     // 发起者 (里程碑9): 群聊 = 群主 seed; 单聊用于好友校验归属
+  string name = 4;         // 群名 (里程碑11, 建群时可带; 单聊忽略)
+}
+
+message CreateConvRsp {
+  Conv conv = 1;
+  bool already_exist = 2;  // 单聊重复创建: 返回已有会话
+  Error error = 3;
+}
+
+// ---------- 全文搜索 (里程碑13) ----------
+
+message SearchMessagesReq {
+  int64 uid = 1;
+  string keyword = 2;      // 非空, 裁剪后 ≥1 rune
+  int32 limit = 3;         // clamp 1..20, 缺省 20
+}
+
+message SearchMessagesRsp {
+  repeated ConvMessage messages = 1;  // 按时间倒序
+  bool truncated = 2;                 // 超过 limit 截断 (前端可提示"仅显示最近部分")
+}

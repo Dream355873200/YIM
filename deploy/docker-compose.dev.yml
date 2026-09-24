@@ -1,0 +1,44 @@
+# 开发依赖: docker compose -f deploy/docker-compose.dev.yml up -d
+version: "3.8"
+
+services:
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --innodb-buffer-pool-size=512M
+    ports:
+      - "3307:3306"   # 3306 被本机 MySQL 服务占用, 容器映射到 3307
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ../scripts/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-proot"]
+      interval: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6380:6379"   # 6379 已被本机其他项目占用
+    volumes:
+      - redis-data:/data
+
+  etcd:
+    image: bitnami/etcd:3.5
+    environment:
+      ALLOW_NONE_AUTHENTICATION: "yes"
+      ETCD_ADVERTISE_CLIENT_URLS: http://etcd:2379
+      ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
+    ports:
+      - "2379:2379"
+    volumes:
+      - etcd-data:/bitnami/etcd
+
+volumes:
+  mysql-data:
+  redis-data:
+  etcd-data:

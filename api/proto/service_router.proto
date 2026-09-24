@@ -1,0 +1,53 @@
+syntax = "proto3";
+
+package yim;
+
+import "common.proto";
+
+option go_package = "github.com/yim/kitex_gen/yim;yim";
+
+// ============================================================
+// Router Svc — 连接路由 (uid → comet 实例)
+//
+// 数据面走 Redis: route:{uid} = Hash{device_id: comet_addr}
+// Comet 在 AUTH 成功/断开时维护自己的表项, Router 提供读聚合与
+// 一致性保护(实例心跳过期自动清除其表项, 防僵尸路由)。
+//
+// 为什么独立成服务而不是 Job 直查 Redis:
+//   1. 多端路由聚合逻辑(全设备/指定设备/优先级)收敛在一处
+//   2. 屏蔽 Redis 结构演进(后续可加一致性哈希环/本地缓存)
+// ============================================================
+
+service RouterService {
+  // 投递前查询目标在线位置。带本地缓存(1s TTL),
+  // miss 时回源 Redis, 兼防缓存穿透(空值短缓存)。
+  rpc GetOnlineDevices(GetOnlineDevicesReq) returns (GetOnlineDevicesRsp);
+
+  // Comet 健康巡检: 实例 lease 过期则清空该实例全部表项
+  // (Scheduler 的僵尸连接清理任务实际执行者)
+  rpc CleanupInstance(CleanupInstanceReq) returns (CleanupInstanceRsp);
+}
+
+message GetOnlineDevicesReq {
+  int64 uid = 1;
+  string device_id = 2;   // 空 = 全部在线设备
+}
+
+message OnlineDevice {
+  string device_id = 1;
+  DeviceType device_type = 2;
+  string comet_addr = 3;  // ip:port (comet 内部 gRPC 监听地址)
+  int64 last_heartbeat_ms = 4;
+}
+
+message GetOnlineDevicesRsp {
+  repeated OnlineDevice devices = 1;
+}
+
+message CleanupInstanceReq {
+  string comet_addr = 1;
+}
+
+message CleanupInstanceRsp {
+  int64 removed_entries = 2;
+}

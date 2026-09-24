@@ -1,0 +1,180 @@
+syntax = "proto3";
+
+package yim;
+
+import "common.proto";
+import "message.proto";
+
+option go_package = "github.com/yim/kitex_gen/yim;yim";
+
+// ============================================================
+// 端 ↔ Comet 长连接协议 (自研二进制协议的 body 定义)
+//
+// 帧结构 (Comet 自定义 Decoder 处理粘包/半包):
+//   | body_len: 4B BE | version: 1B | flag: 1B | cmd: 2B | body: Frame |
+//   flag bit0 = 压缩, bit1 = 预留加密
+// 所有 body 均为本文件中的 Frame, protobuf 序列化。
+// ============================================================
+
+enum Command {
+  CMD_UNKNOWN = 0;
+
+  // 连接生命周期
+  CMD_CONNECT = 1;      // C→S 握手(第一帧), 携带设备信息
+  CMD_CONNECT_RSP = 2;  // S→C 握手应答, 失败则服务端直接断开
+  CMD_HEARTBEAT = 3;    // 双向保活, 30s 间隔, 连续 3 次超时判死
+  CMD_KICK = 4;         // S→C 多端互踢/强制下线, 收到后禁止重连同一 token
+  CMD_DISCONNECT = 5;   // S→C 服务端主动断开前的通知(发布排水)
+
+  // 消息收发 (推拉结合: 推送只带轻通知, 不带消息体)
+  CMD_MESSAGE_UP = 10;  // C→S 上行消息
+  CMD_MESSAGE_UP_RSP = 11;  // S→C 上行确认(服务端已落库, 返回服务端 seq)
+  CMD_MESSAGE_PUSH = 12;    // S→C 轻通知: 仅 conv_id + max_seq
+  CMD_ACK = 13;             // 双向逐条确认 (对 UP_RSP/PUSH 的确认)
+
+  // 同步 (断线重连/唤醒/发现缺号时)
+  CMD_SYNC = 14;        // C→S: 携带各会话本地 last_seq, 拉增量
+  CMD_SYNC_RSP = 15;    // S→C: 增量消息列表
+
+  // 业务事件通知 (里程碑10): 好友/群/在线状态的"推"侧。
+  // 推保证实时, 拉保证可靠 —— 事件可丢可重, 客户端收到后局部重拉。
+  CMD_EVENT = 16;       // S→C: EventFrame (好友申请/同意/删除/群变更/在线)
+  CMD_TYPING = 17;      // C→S: 输入中提示 (里程碑12, 即发即弃不落库)
+}
+
+// 连接级统一信封
+message Frame {
+  uint32 frame_id = 1;      // 客户端自增, 用于请求响应配对
+  Command cmd = 2;
+  Error error = 3;          // 非零时 body 可能无意义
+
+  oneof payload {
+    ConnectReq connect = 10;
+    ConnectRsp connect_rsp = 11;
+    Heartbeat heartbeat = 12;
+    Kick kick = 13;
+    Disconnect disconnect = 14;
+    MessageUpReq message_up = 20;
+    MessageUpRsp message_up_rsp = 21;
+    MessagePush message_push = 22;
+    Ack ack = 23;
+    SyncReq sync = 24;
+    SyncRsp sync_rsp = 25;
+    EventFrame event = 26;
+    Typing typing = 27;
+  }
+}
+
+// ---------- 连接生命周期 ----------
+
+message ConnectReq {
+  string token = 1;       // HTTP 登录时签发的 JWT, Comet 只转发校验
+  DeviceInfo device = 2;  // Comet 校验后写路由表 uid:device → 本实例
+}
+
+message ConnectRsp {
+  int64 server_time_ms = 1; // 客户端时钟校准用
+  // 用户级变更序号快照: 客户端若落后则立即发起 SYNC
+  int64 user_sync_seq = 2;
+}
+
+message Heartbeat {
+  // 携带上行流水水位, 便于服务端检测客户端丢包/假活
+  uint64 last_frame_id = 1;
+}
+
+message Kick {
+  string reason = 1;       // "multi_device_conflict" / "token_invalidated"
+  int64 user_sync_seq = 2; // 被踢端最后同步水位, 重新登录后续传
+}
+
+message Disconnect {
+  string reason = 1;       // "server_maintenance" → 客户端立即重连其他实例
+  int32 retry_after_ms = 2;
+}
+
+// ---------- 消息收发 ----------
+
+message MessageUpReq {
+  uint64 client_msg_id = 1; // 客户端生成的雪花ID, 幂等键(布隆粗筛+Redis精查)
+  int64 conv_id = 2;
+  ConvMsgContent content = 3;
+}
+
+message MessageUpRsp {
+  uint64 client_msg_id = 1;
+  int64 msg_id = 2;         // 服务端分布式ID(号段)
+  int64 seq = 3;            // 会话内单调 seq, 客户端此后以此排序
+  int64 server_time_ms = 4;
+}
+
+// 轻通知: 不含消息体。客户端发现本地 seq < max_seq 时发 SYNC 拉取。
+// 设计依据: 推送可丢可重, 丢失由 SYNC 补齐 —— 推保证实时, 拉保证可靠。
+message MessagePush {
+  int64 conv_id = 1;
+  int64 max_seq = 2;
+  // 群聊时发送者 uid, 用于客户端决定是否拉取(可按免打扰跳过)
+  int64 from_uid = 3;
+  int64 user_sync_seq = 4;
+}
+
+message Ack {
+  int64 conv_id = 1;
+  int64 ack_seq = 2;        // 累积确认: <=ack_seq 全部已收到
+  uint64 client_msg_id = 3; // 上行确认时回填
+  AckTarget target = 4;
+}
+
+enum AckTarget {
+  ACK_UNKNOWN = 0;
+  ACK_FOR_UP = 1;   // 客户端确认上行回执
+  ACK_FOR_PUSH = 2; // 客户端确认下行推送 → 服务端时间轮取消定时
+}
+
+// ---------- 同步 ----------
+
+message SyncReq {
+  // 用户级水位: ConnectRsp 下发的 user_sync_seq
+  int64 user_sync_seq = 1;
+  // 客户端已知的各会话水位, 服务端按差集算增量
+  // (只传有本地数据的会话, 新设备不传 = 全量同步)
+  repeated ConvWatermark watermarks = 2;
+}
+
+message ConvWatermark {
+  int64 conv_id = 1;
+  int64 last_seq = 2;
+}
+
+message SyncRsp {
+  int64 user_sync_seq = 1; // 同步后的新水位
+  repeated ConvMessage messages = 2; // 按 conv_id 分组的增量
+  // 增量过大的会话只返回水位, 客户端走分页历史拉取
+  repeated ConvWatermark overflow = 3;
+}
+
+// ---------- 业务事件 (里程碑10) ----------
+
+// S→C 业务事件通知: 客户端按 type 局部重拉对应列表 (事件不带业务全量数据)。
+message EventFrame {
+  string type = 1;   // FRIEND_REQUEST / FRIEND_HANDLED / FRIEND_DELETED / GROUP_CHANGED / PRESENCE
+  int64 uid = 2;     // 事件主体: 申请人 / 处理人 / 操作者 / 状态变更者
+  int64 conv_id = 3; // 群类事件的会话 id
+  bool online = 4;   // PRESENCE: true=上线
+  int64 seq = 5;     // READ 回执: 对方已读到的 seq (里程碑12)
+}
+
+// 输入中 (里程碑12): C→S 只带会话, from_uid 以连接身份为准; 服务端经
+// Redis ephemeral 通道扇出给会话其他成员, 即发即弃不落库。
+message Typing {
+  int64 conv_id = 1;
+}
+
+// Kafka yim.relation.event 事件体。
+//   关系域事件: relation svc 直发 (targets = 应通知的用户)
+//   在线事件:   comet 发原始 PRESENCE (targets 空) → relation 补齐好友列表再发回本 topic
+// comet 每实例全量消费本 topic, 按 targets 过滤本地在线连接推送 (事件量级低, 无需分区路由)。
+message RelationEvent {
+  EventFrame event = 1;
+  repeated int64 targets = 2;
+}

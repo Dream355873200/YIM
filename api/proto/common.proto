@@ -1,0 +1,37 @@
+syntax = "proto3";
+
+package yim;
+
+option go_package = "github.com/yim/kitex_gen/yim;yim";
+
+// ========== 设备与平台 ==========
+
+enum DeviceType {
+  DEVICE_UNKNOWN = 0;
+  DEVICE_MOBILE = 1;   // 手机端: 后台会被系统杀连接, 需厂商推送兜底
+  DEVICE_DESKTOP = 2;  // 桌面端: 长连接基本常驻
+  DEVICE_WEB = 3;
+}
+
+// 多端在线策略: 手机+桌面各一条连接, 消息双推, 各端独立 ack
+message DeviceInfo {
+  DeviceType type = 1;
+  string device_id = 2;   // 客户端生成的设备唯一标识, 重装不变(持久化)
+  string client_version = 3;
+}
+
+// ========== 通用包装 ==========
+
+// 统一响应头, 业务错误不使用 gRPC status 传递业务语义
+// (gRPC status 只表达传输层错误: 不可达/超时/取消)
+message Error {
+  int32 code = 1;      // 业务错误码, 见 docs/errors.md
+  string msg = 2;
+  // 可选的重试指引: 非零时客户端按毫秒延迟重试
+  int64 retry_after_ms = 3;
+}
+
+message PageInfo {
+  int32 page_num = 1;
+  int32 page_size = 2; // 上限强制 100, 由服务端 clamp
+}
